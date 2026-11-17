@@ -1,4 +1,9 @@
 # SafeTag — Universal Secure Storage Platform
+<p align="center">
+  <a href="https://safetag-project.vercel.app/">
+    <img src="https://img.shields.io/badge/🚀_LIVE_DEMO-Visit_Website-00C853?style=for-the-badge" />
+  </a>
+</p>
 
 SafeTag is a controlled-pilot candidate for staffed belongings custody. Production launch is not approved. Read [verification](docs/pilot/VERIFICATION.md), [AWS prerequisites](docs/pilot/AWS-PREREQUISITES.md), and [migration](docs/pilot/MIGRATION.md) before enabling any real venue or provider.
 
