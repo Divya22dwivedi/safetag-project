@@ -1,0 +1,118 @@
+import { NextRequest, NextResponse } from "next/server";
+import { generateReceiptPdfBuffer } from "@/lib/pdf";
+import {
+  createDeposit,
+  getDepositByTokenId,
+  getDeposits,
+  getVenueById,
+  updateDepositReceipt
+} from "@/lib/repository";
+import { getCurrentSession } from "@/lib/session";
+import { sendDepositCreatedMessages } from "@/lib/notifications";
+import { uploadBase64Asset } from "@/lib/storage";
+import { isDemoMode } from "@/lib/demo-mode";
+
+export async function GET(request: NextRequest) {
+  try {
+    const session = await getCurrentSession();
+    if (!session) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { searchParams } = request.nextUrl;
+    const status = searchParams.get("status") || undefined;
+    const query = searchParams.get("query") || undefined;
+    // Tenant isolation: only this operator's venue deposits, never cross-venue.
+    const deposits = await getDeposits({
+      venueId: session.venueId,
+      status: status as any,
+      query
+    });
+
+    return Response.json({ deposits });
+  } catch (error) {
+    console.error(error);
+    return Response.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const demoMode = isDemoMode();
+    const session = await getCurrentSession();
+
+    if (!session) return NextResponse.json({ error: "Please sign in as venue staff" }, { status: 401 });
+    if (!demoMode) return NextResponse.json({ error: "Use the pilot check-in workspace to record items, capacity and collection credentials.", next: "/pilot", code: "PILOT_WORKFLOW_REQUIRED" }, { status: 409 });
+
+    if (demoMode && (!session || session.role !== "operator")) {
+      return NextResponse.json({ error: "Sign in as the demo operator to create deposits." }, { status: 401 });
+    }
+    const body = await request.json();
+
+    if (demoMode) {
+      if (!session || body.venueId !== session.venueId) {
+        return NextResponse.json({ error: "Sign in as the demo operator to create deposits." }, { status: 401 });
+      }
+      const venue = await getVenueById(session.venueId);
+      if (!venue || body.venueType !== venue.type) {
+        return NextResponse.json({ error: "Only the seeded demo venue can accept deposits." }, { status: 400 });
+      }
+    }
+
+    if (!body.visitorName || !body.visitorPhone || !body.venueId || !body.venueType) {
+      return NextResponse.json(
+        { error: "Missing required deposit fields." },
+        { status: 400 }
+      );
+    }
+
+    const uploadedImageUrl = !demoMode && body.imageBase64
+      ? await uploadBase64Asset(body.imageBase64, "safetag/visitor-items", `visitor-${Date.now()}`)
+      : "";
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const optionalEmail = (value: unknown): string | undefined => {
+      if (typeof value !== "string") return undefined;
+      const trimmed = value.trim();
+      return trimmed && emailPattern.test(trimmed) ? trimmed : undefined;
+    };
+
+    const deposit = await createDeposit({
+      visitorName: demoMode ? "Demo Visitor" : body.visitorName,
+      visitorPhone: demoMode ? "+910000000000" : body.visitorPhone,
+      visitorEmail: demoMode ? undefined : optionalEmail(body.visitorEmail),
+      guardianPhone: demoMode ? undefined : body.guardianPhone,
+      guardianName: demoMode ? undefined : body.guardianName,
+      guardianEmail: demoMode ? undefined : optionalEmail(body.guardianEmail),
+      venueId: body.venueId,
+      venueType: body.venueType,
+      itemsList: body.itemsList ?? [],
+      aiDetectedItems: body.aiDetectedItems ?? [],
+      visitorUploadPhotoUrl: uploadedImageUrl,
+      // Always derive the operator identity from the authenticated session.
+      // Client-supplied checkedInByPhone is ignored to prevent spoofing;
+      // empty string = visitor self check-in (OTP-verified, no operator).
+      checkedInByPhone: session?.phone ?? ""
+    });
+
+    const venue = await getVenueById(deposit.venueId);
+    if (!venue) {
+      return NextResponse.json({ error: "Venue not found." }, { status: 404 });
+    }
+
+    const pdfBuffer = await generateReceiptPdfBuffer(deposit, venue);
+    const pdfDataUri = `data:application/pdf;base64,${pdfBuffer.toString("base64")}`;
+    const pdfUrl = demoMode
+      ? ""
+      : await uploadBase64Asset(pdfDataUri, "safetag/receipts", deposit.tokenId);
+    await updateDepositReceipt(deposit.tokenId, pdfUrl);
+
+    const receipt = (await getDepositByTokenId(deposit.tokenId)) ?? deposit;
+    if (!demoMode) await sendDepositCreatedMessages(receipt, venue);
+
+    return NextResponse.json({ success: true, deposit: receipt });
+  } catch (error) {
+    console.error(error);
+    return Response.json({ error: "Internal Server Error" }, { status: 500 });
+  }
+}

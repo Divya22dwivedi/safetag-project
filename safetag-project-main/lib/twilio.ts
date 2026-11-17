@@ -1,0 +1,138 @@
+import Twilio from "twilio";
+import { OtpPurpose } from "@/types";
+import { isDemoMode } from "@/lib/demo-mode";
+import { phone as normalizePhone } from "@/lib/pilot/security";
+
+const twilioCredentialsConfigured =
+  Boolean(process.env.TWILIO_ACCOUNT_SID) &&
+  Boolean(process.env.TWILIO_AUTH_TOKEN);
+
+export function isTwilioConfigured(): boolean {
+  return !isDemoMode() && twilioCredentialsConfigured;
+}
+
+const verifyConfigured =
+  twilioCredentialsConfigured && Boolean(process.env.TWILIO_VERIFY_SERVICE_SID);
+
+type TwilioClient = ReturnType<typeof Twilio>;
+
+let cachedClient: TwilioClient | null = null;
+
+function getTwilioClient() {
+  if (!twilioCredentialsConfigured || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) {
+    return null;
+  }
+
+  if (!cachedClient) {
+    cachedClient = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  }
+
+  return cachedClient;
+}
+
+const rateLimitStore = new Map<string, number[]>();
+
+function assertRateLimit(key: string, limit = 5, windowMs = 10 * 60 * 1000) {
+  const now = Date.now();
+  const timestamps = rateLimitStore.get(key) ?? [];
+  const filtered = timestamps.filter((value) => now - value < windowMs);
+  if (filtered.length >= limit) {
+    throw new Error("Too many OTP requests. Please wait and try again.");
+  }
+  filtered.push(now);
+  rateLimitStore.set(key, filtered);
+}
+
+export async function sendOtp(phone: string, purpose: OtpPurpose) {
+  if (isDemoMode()) {
+    throw new Error("OTP delivery is disabled in DEMO MODE.");
+  }
+  assertRateLimit(`${purpose}:${phone}`);
+
+  const client = getTwilioClient();
+
+  if (verifyConfigured && client && process.env.TWILIO_VERIFY_SERVICE_SID) {
+    await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verifications.create({ to: phone, channel: "sms" });
+
+    return { mode: "twilio" as const };
+  }
+
+  const error = new Error(
+    "OTP service not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID."
+  );
+  (error as NodeJS.ErrnoException).code = "OTP_NOT_CONFIGURED";
+  throw error;
+}
+
+export async function verifyOtp(phone: string, purpose: OtpPurpose, code: string) {
+  if (isDemoMode()) return false;
+  const client = getTwilioClient();
+
+  if (verifyConfigured && client && process.env.TWILIO_VERIFY_SERVICE_SID) {
+    const result = await client.verify.v2
+      .services(process.env.TWILIO_VERIFY_SERVICE_SID)
+      .verificationChecks.create({ to: phone, code });
+
+    return result.status === "approved";
+  }
+
+  return false;
+}
+
+function formatIndianNumber(phone: string): string {
+  return normalizePhone.parse(phone);
+}
+
+function getWhatsAppFromNumber() {
+  return (
+    process.env.TWILIO_WHATSAPP_NUMBER ||
+    process.env.TWILIO_WHATSAPP_FROM ||
+    "whatsapp:+14155238886"
+  );
+}
+
+export async function sendWhatsAppAlert(numbers: string[], message: string) {
+  if (isDemoMode()) return null;
+  if (process.env.ALLOW_AUTHORIZED_TEST_SEND !== "true") return null;
+  const uniqueNumbers = [...new Set(numbers.filter(Boolean))];
+  if (!uniqueNumbers.length) return null;
+
+  const client = getTwilioClient();
+
+  if (!client) {
+    console.error("WhatsApp error: Twilio client is not configured");
+    return null;
+  }
+
+  const messageSids: string[] = [];
+
+  for (const number of uniqueNumbers) {
+    try {
+      const formattedPhone = formatIndianNumber(number);
+      if (!(process.env.NOTIFICATION_TEST_RECIPIENTS || "").split(",").includes(formattedPhone)) return null;
+      const phone = formattedPhone.replace(/^\+91/, "");
+
+
+      const response = await client.messages.create({
+        from: getWhatsAppFromNumber(),
+        to: `whatsapp:+91${phone}`,
+        body: message
+      });
+
+      console.log(JSON.stringify({ event: "test_message_queued", sid: response.sid }));
+      messageSids.push(response.sid);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "test_message_failed", type: error instanceof Error ? error.name : "UnknownError" }));
+      return null;
+    }
+  }
+
+  return messageSids;
+}
+
+export async function sendWhatsAppMessage(to: string, message: string) {
+  const result = await sendWhatsAppAlert([to], message);
+  return result?.[0] ?? null;
+}
